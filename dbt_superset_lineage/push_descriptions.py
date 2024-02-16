@@ -7,7 +7,7 @@ from markdown import markdown
 from requests import HTTPError
 
 from .superset_api import Superset
-from schemas.dbt_manifest_v9 import Model as DbtManifest, ModelNode
+from dbt_schemas.dbt_manifest_v9 import Model as DbtManifest, ModelNode
 from .utils import get_datasets_from_superset, get_tables_from_dbt
 import threading
 
