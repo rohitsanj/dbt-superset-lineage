@@ -53,11 +53,12 @@ def push_descriptions(dbt_project_dir: str = typer.Option('.', help="Directory p
                                                                      "Can be automatically generated if "
                                                                      "SUPERSET_REFRESH_TOKEN is provided."),
                       superset_refresh_token: str = typer.Option(None, envvar="SUPERSET_REFRESH_TOKEN",
-                                                                 help="Refresh token to Superset API.")):
-
+                                                                 help="Refresh token to Superset API."),
+                      create_dataset_if_not_exists: bool = typer.Option(False)
+                      ):
     push_descriptions_main(dbt_project_dir, dbt_db_name,
                            superset_url, superset_db_id, superset_refresh_columns, superset_pause_after_update,
-                           superset_access_token, superset_refresh_token)
+                           superset_access_token, superset_refresh_token, create_dataset_if_not_exists)
 
 
 if __name__ == '__main__':

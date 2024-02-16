@@ -1,4 +1,3 @@
-import json
 import logging
 import re
 import time
@@ -8,93 +7,11 @@ from markdown import markdown
 from requests import HTTPError
 
 from .superset_api import Superset
+from schemas.dbt_manifest_v9 import Model as DbtManifest, ModelNode
+from .utils import get_datasets_from_superset, get_tables_from_dbt
+import threading
 
 logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
-
-
-def get_datasets_from_superset(superset, superset_db_id):
-    logging.info("Getting physical datasets from Superset.")
-
-    page_number = 0
-    datasets = []
-    datasets_keys = set()
-    while True:
-        logging.info("Getting page %d.", page_number + 1)
-
-        payload = {
-            'q': json.dumps({
-                'page': page_number,
-                'page_size': 100
-            })
-        }
-        res = superset.request('GET', '/dataset/', params=payload)
-
-        result = res['result']
-        if result:
-            for r in result:
-                kind = r['kind']
-                database_id = r['database']['id']
-
-                if kind == 'physical' \
-                        and (superset_db_id is None or database_id == superset_db_id):
-
-                    dataset_id = r['id']
-
-                    name = r['table_name']
-                    schema = r['schema']
-                    dataset_key = f'{schema}.{name}'  # used as unique identifier
-
-                    dataset_dict = {
-                        'id': dataset_id,
-                        'key': dataset_key
-                    }
-
-                    # fail if it breaks uniqueness constraint
-                    assert dataset_key not in datasets_keys, \
-                        f"Dataset {dataset_key} is a duplicate name (schema + table) " \
-                        "across databases. " \
-                        "This would result in incorrect matching between Superset and dbt. " \
-                        "To fix this, remove duplicates or add the ``superset_db_id`` argument."
-
-                    datasets_keys.add(dataset_key)
-                    datasets.append(dataset_dict)
-            page_number += 1
-        else:
-            break
-
-    assert datasets, "There are no datasets in Superset!"
-
-    return datasets
-
-
-def get_tables_from_dbt(dbt_manifest, dbt_db_name):
-    tables = {}
-    for table_type in ['nodes', 'sources']:
-        manifest_subset = dbt_manifest[table_type]
-
-        for table_key_long in manifest_subset:
-            table = manifest_subset[table_key_long]
-            name = table['name']
-            schema = table['schema']
-            database = table['database']
-
-            table_key_short = schema + '.' + name
-            columns = table['columns']
-            description = table['description']
-
-            if dbt_db_name is None or database == dbt_db_name:
-                # fail if it breaks uniqueness constraint
-                assert table_key_short not in tables, \
-                    f"Table {table_key_short} is a duplicate name (schema + table) " \
-                    f"across databases. " \
-                    "This would result in incorrect matching between Superset and dbt. " \
-                    "To fix this, remove duplicates or add the ``dbt_db_name`` argument."
-
-                tables[table_key_short] = {'columns': columns, 'description': description}
-
-    assert tables, "Manifest is empty!"
-
-    return tables
 
 
 def refresh_columns_in_superset(superset, dataset_id):
@@ -143,15 +60,19 @@ def convert_markdown_to_plain_text(md_string):
     return single_line
 
 
-def merge_columns_info(dataset, tables):
+def merge_columns_info(dataset, tables: dict[str, ModelNode]):
     logging.info("Merging columns info from Superset and manifest.json file.")
 
     key = dataset['key']
     sst_columns = dataset['columns']
-    dbt_columns = tables.get(key, {}).get('columns', {})
+    dbt_columns = {}
 
     sst_description = dataset['description']
-    dbt_description = tables.get(key, {}).get('description')
+    dbt_description = None
+
+    if key in tables:
+        dbt_columns = tables[key].columns
+        dbt_description = tables[key].description
 
     sst_owners = dataset['owners']
 
@@ -228,9 +149,46 @@ def put_descriptions_to_superset(superset, dataset, superset_pause_after_update)
         logging.info("Skipping PUT execute request as nothing would be updated.")
 
 
+def create_dataset(
+        superset: Superset, superset_db_id: int, dbt_table: ModelNode,
+):
+    # Get or create from Superset
+    # Schema: https://github.com/apache/superset/blob/master/superset/datasets/schemas.py#L270-L284
+    logging.info(f"Starting to create dataset for dbt table '{dbt_table.name}'")
+    resp: dict = superset.request("POST", "/dataset/get_or_create", json={
+        "database_id": superset_db_id,
+        "schema": dbt_table.schema_,
+        "table_name": dbt_table.name,
+    })
+    table_id = resp.get("result", {}).get("table_id")
+    logging.info(f"Created dataset in Superset with id {table_id}")
+    assert table_id, "No table_id returned, something's broken!"
+
+
+def create_datasets_from_dbt_tables(dbt_tables, superset, superset_db_id):
+    sst_datasets = get_datasets_from_superset(superset, superset_db_id)
+    logging.info("There are %d physical datasets in Superset overall.", len(sst_datasets))
+    sst_dataset_keys = set(d["key"] for d in sst_datasets)
+    dbt_tables_not_in_superset: list[ModelNode] = [
+        val for key, val in dbt_tables.items() if key not in sst_dataset_keys
+    ]
+    logging.info(f"About to create {len(dbt_tables_not_in_superset)} datasets in Superset")
+    create_dataset_threads = [
+        threading.Thread(target=create_dataset, args=(superset, superset_db_id, dbt_table), )
+        for dbt_table in dbt_tables_not_in_superset
+    ]
+    # Start all the threads
+    for thread in create_dataset_threads:
+        thread.start()
+    # Wait for all threads to complete
+    for thread in create_dataset_threads:
+        thread.join()
+    logging.info("Successfully created datasets from dbt models")
+
+
 def main(dbt_project_dir, dbt_db_name,
          superset_url, superset_db_id, superset_refresh_columns, superset_pause_after_update,
-         superset_access_token, superset_refresh_token):
+         superset_access_token, superset_refresh_token, create_dataset_if_not_exists=False):
 
     # require at least one token for Superset
     assert superset_access_token is not None or superset_refresh_token is not None, \
@@ -242,14 +200,15 @@ def main(dbt_project_dir, dbt_db_name,
                         access_token=superset_access_token, refresh_token=superset_refresh_token)
 
     logging.info("Starting the script!")
-
-    sst_datasets = get_datasets_from_superset(superset, superset_db_id)
-    logging.info("There are %d physical datasets in Superset overall.", len(sst_datasets))
-
-    with open(f'{dbt_project_dir}/target/manifest.json') as f:
-        dbt_manifest = json.load(f)
+    dbt_manifest = DbtManifest.parse_file(f'{dbt_project_dir}/target/manifest.json')
 
     dbt_tables = get_tables_from_dbt(dbt_manifest, dbt_db_name)
+
+    if create_dataset_if_not_exists:
+        create_datasets_from_dbt_tables(dbt_tables, superset, superset_db_id)
+
+    # Fetch again after creating
+    sst_datasets = get_datasets_from_superset(superset, superset_db_id)
 
     sst_datasets_dbt_filtered = [d for d in sst_datasets if d["key"] in dbt_tables]
     logging.info("There are %d physical datasets in Superset with a match in dbt.", len(sst_datasets_dbt_filtered))
@@ -269,3 +228,4 @@ def main(dbt_project_dir, dbt_db_name,
                           sst_dataset_id, exc_info=e)
 
     logging.info("All done!")
+
