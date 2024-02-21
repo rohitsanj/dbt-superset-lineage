@@ -1,7 +1,7 @@
 import json
 import logging
 
-from dbt_schemas.dbt_manifest_v9 import Model as DbtManifest, ModelNode
+from dbt_superset_lineage.dbt_schemas.dbt_manifest_v9 import Model as DbtManifest, ModelNode
 
 
 def get_datasets_from_superset(superset, superset_db_id):
